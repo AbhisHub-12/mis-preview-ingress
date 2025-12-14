@@ -63,32 +63,49 @@ locals {
 
   ingressDetails = { for k, v in local.domains : k => v }
 
+  # Extract metadata annotations excluding configuration-snippet (will be merged separately)
+  metadata_annotations_without_config_snippet = {
+    for k, v in lookup(lookup(var.instance, "metadata", {}), "annotations", {}) :
+    k => v if k != "nginx.ingress.kubernetes.io/configuration-snippet"
+  }
+
+  # Get configuration-snippet from metadata if present
+  metadata_config_snippet = lookup(lookup(lookup(var.instance, "metadata", {}), "annotations", {}), "nginx.ingress.kubernetes.io/configuration-snippet", "")
+
   # Process more_set_headers into configuration snippet if present
-  more_set_headers_config = lookup(var.instance.spec, "more_set_headers", null) != null ? {
-    "nginx.ingress.kubernetes.io/configuration-snippet" = join("", [
-      for header_key, header_config in var.instance.spec.more_set_headers :
-      "more_set_headers \"${lookup(header_config, "header_name", "")}: ${lookup(header_config, "header_value", "")}\";\n"
-      if lookup(header_config, "header_name", "") != ""
-    ])
-  } : {}
+  more_set_headers_snippet = lookup(var.instance.spec, "more_set_headers", null) != null ? join("", [
+    for header_key, header_config in var.instance.spec.more_set_headers :
+    "more_set_headers \"${lookup(header_config, "header_name", "")}: ${lookup(header_config, "header_value", "")}\";\n"
+    if lookup(header_config, "header_name", "") != ""
+  ]) : ""
 
   # Process conditional_set_headers into configuration snippet if present
-  conditional_set_headers_config = lookup(var.instance.spec, "conditional_set_headers", null) != null ? {
-    "nginx.ingress.kubernetes.io/configuration-snippet" = join("", [
-      for condition_key, condition_config in var.instance.spec.conditional_set_headers :
-      "if (${lookup(condition_config, "left", "")} ${lookup(condition_config, "operator", "=")} \"${lookup(condition_config, "right", "")}\") {\n${join("", [
-        for header_key, header_config in lookup(condition_config, "headers", {}) :
-        "  add_header ${lookup(header_config, "header_name", "")} \"${lookup(header_config, "header_value", "")}\";\n"
-        if lookup(header_config, "header_name", "") != ""
-      ])}}${condition_key != element(keys(var.instance.spec.conditional_set_headers), length(keys(var.instance.spec.conditional_set_headers)) - 1) ? "\n" : ""}"
-    ])
+  conditional_set_headers_snippet = lookup(var.instance.spec, "conditional_set_headers", null) != null ? join("", [
+    for condition_key, condition_config in var.instance.spec.conditional_set_headers :
+    "if (${lookup(condition_config, "left", "")} ${lookup(condition_config, "operator", "=")} \"${lookup(condition_config, "right", "")}\") {\n${join("", [
+      for header_key, header_config in lookup(condition_config, "headers", {}) :
+      "  add_header ${lookup(header_config, "header_name", "")} \"${lookup(header_config, "header_value", "")}\";\n"
+      if lookup(header_config, "header_name", "") != ""
+    ])}}${condition_key != element(keys(var.instance.spec.conditional_set_headers), length(keys(var.instance.spec.conditional_set_headers)) - 1) ? "\n" : ""}"
+  ]) : ""
+
+  # Merge all configuration snippets: metadata + more_set_headers + conditional_set_headers
+  merged_configuration_snippet = join("", compact([
+    local.metadata_config_snippet,
+    local.more_set_headers_snippet,
+    local.conditional_set_headers_snippet
+  ]))
+
+  # Create configuration-snippet annotation only if content exists
+  merged_config_snippet_annotation = local.merged_configuration_snippet != "" ? {
+    "nginx.ingress.kubernetes.io/configuration-snippet" = local.merged_configuration_snippet
   } : {}
 
   common_annotations = merge(
     {
       "nginx.ingress.kubernetes.io/use-regex" : "true"
     },
-    lookup(lookup(var.instance, "metadata", {}), "annotations", {}),
+    local.metadata_annotations_without_config_snippet,
     lookup(var.instance.spec, "force_ssl_redirection", false) ? {
       "nginx.ingress.kubernetes.io/force-ssl-redirect" = "true"
       "nginx.ingress.kubernetes.io/ssl-redirect"       = "true"
@@ -102,8 +119,7 @@ locals {
       "nginx.ingress.kubernetes.io/proxy-read-timeout" : "300"
       "nginx.ingress.kubernetes.io/proxy-send-timeout" : "300"
     },
-    local.more_set_headers_config,
-    local.conditional_set_headers_config
+    local.merged_config_snippet_annotation
   )
   aws_annotations = merge(
     lookup(var.instance.spec, "private", false) == true ? {
@@ -157,8 +173,7 @@ locals {
     var.environment.cloud == "AWS" ? local.aws_annotations : {},
     var.environment.cloud == "GCP" ? local.gcp_annotations : {},
     var.environment.cloud == "AZURE" ? local.azure_annotations : {},
-    local.additional_ingress_annotations_without_auth,
-    lookup(lookup(var.instance, "metadata", {}), "annotations", {})
+    local.additional_ingress_annotations_without_auth
   )
   nginx_annotations = {
     for key, value in local.annotations :
@@ -320,7 +335,7 @@ resource "helm_release" "nginx_ingress_ctlr" {
   depends_on = [module.custom_error_pages_configmap]
 
   repository  = local.chart_version_specified ? "https://kubernetes.github.io/ingress-nginx" : null
-  chart       = local.chart_version_specified ? "ingress-nginx" : "${path.module}/../../../charts/ingress-nginx/ingress-nginx-4.2.6.tgz"
+  chart       = local.chart_version_specified ? "ingress-nginx" : "${path.module}/ingress-nginx/ingress-nginx-4.2.6.tgz"
   version     = local.chart_version_specified ? lookup(var.instance.spec, "ingress_chart_version", "4.12.1") : null
   namespace   = var.environment.namespace
   max_history = 10
@@ -537,7 +552,6 @@ locals {
         annotations = merge(
           lookup(lookup(value, "custom_tls", {}), "enabled", false) ? {} : local.cert_manager_common_annotations,
           local.annotations,
-          lookup(value, "annotations", {}),
           lookup(var.instance.spec, "basicAuth", lookup(var.instance.spec, "basic_auth", false)) ? (lookup(value, "disable_auth", false) ? {} : local.additional_ingress_annotations_with_auth) : {},
           lookup(value, "grpc", false) ? {
             "nginx.ingress.kubernetes.io/backend-protocol" : "GRPC"
@@ -546,74 +560,19 @@ locals {
           lookup(value, "enable_rewrite_target", false) == true && lookup(value, "rewrite_target", null) != null ? {
             "nginx.ingress.kubernetes.io/rewrite-target" = lookup(value, "rewrite_target", "")
           } : {},
-          # Process configuration snippets for headers
-          lookup(var.instance.spec, "more_set_headers", null) != null || lookup(value, "more_set_headers", null) != null ||
-          lookup(var.instance.spec, "conditional_set_headers", null) != null || lookup(value, "conditional_set_headers", null) != null ? {
-            "nginx.ingress.kubernetes.io/configuration-snippet" = join("", concat(
-              # Process more_set_headers
-              [
-                for header_name in distinct(concat(
-                  # Get all header names from common headers
-                  [
-                    for header_key, header_config in lookup(var.instance.spec, "more_set_headers", {}) :
-                    lookup(header_config, "header_name", "")
-                    if lookup(header_config, "header_name", "") != ""
-                  ],
-                  # Get all header names from rule-level headers
-                  [
-                    for header_key, header_config in lookup(value, "more_set_headers", {}) :
-                    lookup(header_config, "header_name", "")
-                    if lookup(header_config, "header_name", "") != ""
-                  ]
-                )) :
-                # For each unique header name, check if it exists in rule-level headers first, then fall back to common headers
-                (
-                  contains([
-                    for header_key, header_config in lookup(value, "more_set_headers", {}) :
-                    lookup(header_config, "header_name", "")
-                  ], header_name) ?
-                  # If header exists in rule-level, use that value
-                  "more_set_headers \"${header_name}: ${lookup(
-                    {
-                      for header_key, header_config in lookup(value, "more_set_headers", {}) :
-                      lookup(header_config, "header_name", "") => lookup(header_config, "header_value", "")
-                      if lookup(header_config, "header_name", "") == header_name
-                    },
-                    header_name,
-                    ""
-                  )}\";\n" :
-                  # Otherwise use common header value
-                  "more_set_headers \"${header_name}: ${lookup(
-                    {
-                      for header_key, header_config in lookup(var.instance.spec, "more_set_headers", {}) :
-                      lookup(header_config, "header_name", "") => lookup(header_config, "header_value", "")
-                      if lookup(header_config, "header_name", "") == header_name
-                    },
-                    header_name,
-                    ""
-                  )}\";\n"
-                )
-              ],
-              # Process rule-level conditional_set_headers (these take precedence over common ones)
-              lookup(value, "conditional_set_headers", null) != null ? [
-                for condition_key, condition_config in lookup(value, "conditional_set_headers", {}) :
-                "if (${lookup(condition_config, "left", "")} ${lookup(condition_config, "operator", "=")} \"${lookup(condition_config, "right", "")}\") {\n${join("", [
-                  for header_key, header_config in lookup(condition_config, "headers", {}) :
-                  "  add_header ${lookup(header_config, "header_name", "")} \"${lookup(header_config, "header_value", "")}\";\n"
-                  if lookup(header_config, "header_name", "") != ""
-                ])}}${condition_key != element(keys(lookup(value, "conditional_set_headers", {})), length(keys(lookup(value, "conditional_set_headers", {}))) - 1) ? "\n" : ""}"
-              ] : [],
-              # Process common conditional_set_headers if no rule-level ones exist
-              lookup(value, "conditional_set_headers", null) == null && lookup(var.instance.spec, "conditional_set_headers", null) != null ? [
-                for condition_key, condition_config in var.instance.spec.conditional_set_headers :
-                "if (${lookup(condition_config, "left", "")} ${lookup(condition_config, "operator", "=")} \"${lookup(condition_config, "right", "")}\") {\n${join("", [
-                  for header_key, header_config in lookup(condition_config, "headers", {}) :
-                  "  add_header ${lookup(header_config, "header_name", "")} \"${lookup(header_config, "header_value", "")}\";\n"
-                  if lookup(header_config, "header_name", "") != ""
-                ])}}${condition_key != element(keys(var.instance.spec.conditional_set_headers), length(keys(var.instance.spec.conditional_set_headers)) - 1) ? "\n" : ""}"
-              ] : []
-            ))
-          } : {}
+          # Merge annotations excluding configuration-snippet first
+          lookup(lookup(value, "annotations", {}), "nginx.ingress.kubernetes.io/configuration-snippet", "") != "" ?
+          merge(
+            { for k, v in lookup(value, "annotations", {}) : k => v if k != "nginx.ingress.kubernetes.io/configuration-snippet" },
+            {
+              "nginx.ingress.kubernetes.io/configuration-snippet" = join("\n", compact([
+                # 1. Global configuration-snippet from local.annotations (if exists)
+                lookup(local.annotations, "nginx.ingress.kubernetes.io/configuration-snippet", ""),
+                # 2. Rule-level custom configuration-snippet from annotations (must be merged, not replaced)
+                lookup(lookup(value, "annotations", {}), "nginx.ingress.kubernetes.io/configuration-snippet", "")
+              ]))
+            }
+          ) : lookup(value, "annotations", {})
         )
       }
       spec = {
@@ -657,7 +616,6 @@ locals {
         annotations = merge(
           lookup(lookup(value, "custom_tls", {}), "enabled", false) ? {} : local.cert_manager_common_annotations,
           local.nginx_annotations,
-          lookup(value, "annotations", {}),
           lookup(var.instance.spec, "basicAuth", lookup(var.instance.spec, "basic_auth", false)) ? (lookup(value, "disable_auth", false) ? {} : local.additional_ingress_annotations_with_auth) : {},
           lookup(value, "grpc", false) ? {
             "nginx.ingress.kubernetes.io/backend-protocol" : "GRPC"
@@ -702,75 +660,19 @@ locals {
               ])
             } : {}
           ) : {},
-          # Process configuration snippets for headers - merge common headers with rule-specific headers
-          # with rule-level headers taking precedence in case of duplicates
-          lookup(var.instance.spec, "more_set_headers", null) != null || lookup(value, "more_set_headers", null) != null ||
-          lookup(var.instance.spec, "conditional_set_headers", null) != null || lookup(value, "conditional_set_headers", null) != null ? {
-            "nginx.ingress.kubernetes.io/configuration-snippet" = join("", concat(
-              # Process more_set_headers
-              [
-                for header_name in distinct(concat(
-                  # Get all header names from common headers
-                  [
-                    for header_key, header_config in lookup(var.instance.spec, "more_set_headers", {}) :
-                    lookup(header_config, "header_name", "")
-                    if lookup(header_config, "header_name", "") != ""
-                  ],
-                  # Get all header names from rule-level headers
-                  [
-                    for header_key, header_config in lookup(value, "more_set_headers", {}) :
-                    lookup(header_config, "header_name", "")
-                    if lookup(header_config, "header_name", "") != ""
-                  ]
-                )) :
-                # For each unique header name, check if it exists in rule-level headers first, then fall back to common headers
-                (
-                  contains([
-                    for header_key, header_config in lookup(value, "more_set_headers", {}) :
-                    lookup(header_config, "header_name", "")
-                  ], header_name) ?
-                  # If header exists in rule-level, use that value
-                  "more_set_headers \"${header_name}: ${lookup(
-                    {
-                      for header_key, header_config in lookup(value, "more_set_headers", {}) :
-                      lookup(header_config, "header_name", "") => lookup(header_config, "header_value", "")
-                      if lookup(header_config, "header_name", "") == header_name
-                    },
-                    header_name,
-                    ""
-                  )}\";\n" :
-                  # Otherwise use common header value
-                  "more_set_headers \"${header_name}: ${lookup(
-                    {
-                      for header_key, header_config in lookup(var.instance.spec, "more_set_headers", {}) :
-                      lookup(header_config, "header_name", "") => lookup(header_config, "header_value", "")
-                      if lookup(header_config, "header_name", "") == header_name
-                    },
-                    header_name,
-                    ""
-                  )}\";\n"
-                )
-              ],
-              # Process rule-level conditional_set_headers (these take precedence over common ones)
-              lookup(value, "conditional_set_headers", null) != null ? [
-                for condition_key, condition_config in lookup(value, "conditional_set_headers", {}) :
-                "if (${lookup(condition_config, "left", "")} ${lookup(condition_config, "operator", "=")} \"${lookup(condition_config, "right", "")}\") {\n${join("", [
-                  for header_key, header_config in lookup(condition_config, "headers", {}) :
-                  "  add_header ${lookup(header_config, "header_name", "")} \"${lookup(header_config, "header_value", "")}\";\n"
-                  if lookup(header_config, "header_name", "") != ""
-                ])}}${condition_key != element(keys(lookup(value, "conditional_set_headers", {})), length(keys(lookup(value, "conditional_set_headers", {}))) - 1) ? "\n" : ""}"
-              ] : [],
-              # Process common conditional_set_headers if no rule-level ones exist
-              lookup(value, "conditional_set_headers", null) == null && lookup(var.instance.spec, "conditional_set_headers", null) != null ? [
-                for condition_key, condition_config in var.instance.spec.conditional_set_headers :
-                "if (${lookup(condition_config, "left", "")} ${lookup(condition_config, "operator", "=")} \"${lookup(condition_config, "right", "")}\") {\n${join("", [
-                  for header_key, header_config in lookup(condition_config, "headers", {}) :
-                  "  add_header ${lookup(header_config, "header_name", "")} \"${lookup(header_config, "header_value", "")}\";\n"
-                  if lookup(header_config, "header_name", "") != ""
-                ])}}${condition_key != element(keys(var.instance.spec.conditional_set_headers), length(keys(var.instance.spec.conditional_set_headers)) - 1) ? "\n" : ""}"
-              ] : []
-            ))
-          } : {}
+          # Merge annotations excluding configuration-snippet first
+          lookup(lookup(value, "annotations", {}), "nginx.ingress.kubernetes.io/configuration-snippet", "") != "" ?
+          merge(
+            { for k, v in lookup(value, "annotations", {}) : k => v if k != "nginx.ingress.kubernetes.io/configuration-snippet" },
+            {
+              "nginx.ingress.kubernetes.io/configuration-snippet" = join("\n", compact([
+                # 1. Global configuration-snippet from local.nginx_annotations (if exists)
+                lookup(local.nginx_annotations, "nginx.ingress.kubernetes.io/configuration-snippet", ""),
+                # 2. Rule-level custom configuration-snippet from annotations (must be merged, not replaced)
+                lookup(lookup(value, "annotations", {}), "nginx.ingress.kubernetes.io/configuration-snippet", "")
+              ]))
+            }
+          ) : lookup(value, "annotations", {})
         )
       }
       spec = {
